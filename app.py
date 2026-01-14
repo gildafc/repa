@@ -64,36 +64,46 @@ app.add_middleware(
     max_age=3600,  # Cache preflight requests for 1 hour
 )
 
-# Initialize Supabase client
+# Initialize Supabase client (optional at boot; required for auth/db features)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # Service role key for admin operations
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in environment variables")
+supabase: Optional[Client] = None
+supabase_admin: Optional[Client] = None
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-# Use service role key for admin operations (bypasses RLS)
-if SUPABASE_SERVICE_KEY:
-    supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-    logger.info("Supabase admin client initialized with service role key")
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    # Use service role key for admin operations (bypasses RLS)
+    if SUPABASE_SERVICE_KEY:
+        supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        logger.info("Supabase admin client initialized with service role key")
+    else:
+        supabase_admin = supabase
+        logger.warning("SUPABASE_SERVICE_KEY not set - admin operations will use anon key (may fail with RLS)")
 else:
-    supabase_admin: Client = supabase
-    logger.warning("SUPABASE_SERVICE_KEY not set - admin operations will use anon key (may fail with RLS)")
+    logger.warning("Supabase not configured (SUPABASE_URL / SUPABASE_KEY missing). App will run, but auth/db features are disabled.")
 
-# JWT settings
-JWT_SECRET = os.getenv("JWT_SECRET", SUPABASE_KEY)  # Use Supabase key as JWT secret
+# JWT settings (optional at boot; required for auth-protected endpoints)
+JWT_SECRET = os.getenv("JWT_SECRET") or SUPABASE_KEY
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
-# Validate JWT_SECRET is set
-if not JWT_SECRET:
-    raise ValueError("JWT_SECRET or SUPABASE_KEY must be set in environment variables")
-
-logger.info(f"JWT configured with algorithm {JWT_ALGORITHM}, expiration {JWT_EXPIRATION_HOURS} hours")
+if JWT_SECRET:
+    logger.info(f"JWT configured with algorithm {JWT_ALGORITHM}, expiration {JWT_EXPIRATION_HOURS} hours")
+else:
+    logger.warning("JWT not configured (JWT_SECRET missing). Auth-protected endpoints are disabled.")
 
 # Security
 security = HTTPBearer()
+
+def _require_supabase() -> None:
+    """Guard for endpoints that require Supabase (auth/db)."""
+    if not supabase or not supabase_admin:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server database/auth is not configured (missing Supabase environment variables).",
+        )
 
 
 class ChatRequest(BaseModel):
@@ -171,6 +181,8 @@ class UserCriteriaResponse(BaseModel):
 # Authentication helpers
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """Create JWT access token"""
+    if not JWT_SECRET:
+        raise HTTPException(status_code=503, detail="Server authentication is not configured (JWT_SECRET missing)")
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
@@ -183,6 +195,11 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Verify JWT token and return user_id"""
+    if not JWT_SECRET:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server authentication is not configured (JWT_SECRET missing)",
+        )
     token = credentials.credentials
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -766,6 +783,7 @@ Return ONLY the formatted match analysis, ready to display to the user."""
 @app.post("/auth/register", response_model=AuthResponse)
 async def register(request: RegisterRequest):
     """Register a new user"""
+    _require_supabase()
     try:
         # Create user in Supabase Auth
         auth_response = supabase.auth.sign_up({
@@ -794,6 +812,7 @@ async def register(request: RegisterRequest):
 @app.post("/auth/login", response_model=AuthResponse)
 async def login(request: LoginRequest):
     """Login user and return JWT token"""
+    _require_supabase()
     try:
         # Authenticate with Supabase
         auth_response = supabase.auth.sign_in_with_password({
@@ -823,6 +842,7 @@ async def login(request: LoginRequest):
 @app.get("/api/user/criteria", response_model=UserCriteriaResponse)
 async def get_user_criteria(user_id: str = Depends(verify_token)):
     """Get user's saved criteria"""
+    _require_supabase()
     try:
         logger.info(f"Fetching criteria for user_id: {user_id}")
         # Use service role client for backend operations (bypasses RLS since we verify JWT ourselves)
@@ -1270,6 +1290,7 @@ async def create_user_criteria(
     user_id: str = Depends(verify_token)
 ):
     """Create or update user criteria"""
+    _require_supabase()
     try:
         # Use service role client for backend operations (bypasses RLS since we verify JWT ourselves)
         # Check if criteria already exists
@@ -1317,6 +1338,7 @@ async def update_user_criteria(
     user_id: str = Depends(verify_token)
 ):
     """Update user criteria"""
+    _require_supabase()
     try:
         criteria_data = criteria.dict(exclude_none=True)
         criteria_data["updated_at"] = datetime.utcnow().isoformat()
@@ -1347,6 +1369,7 @@ async def check_email_manual(
     user_id: str = Depends(verify_token)
 ):
     """Manually trigger email check"""
+    _require_supabase()
     try:
         # Get user criteria with email settings
         criteria_response = supabase_admin.table("user_criteria").select("*").eq("user_id", user_id).execute()
@@ -1414,6 +1437,7 @@ async def get_email_analyses(
     limit: int = 50
 ):
     """Get email analysis results for the user"""
+    _require_supabase()
     try:
         # Use service role client for backend operations (bypasses RLS since we verify JWT ourselves)
         # Get all processed emails with analysis results for this user
@@ -1536,6 +1560,7 @@ async def chat(request: ChatRequest, user_id: str = Depends(verify_token)):
     """
     Process a chat message with apartment criteria. Optionally analyze a listing URL if provided.
     """
+    _require_supabase()
     try:
         # Extract URL from message (optional)
         user_message, listing_url = extract_url_from_message(request.message)
@@ -1720,6 +1745,32 @@ async def read_root():
     with open("static/index.html", "r") as f:
         return f.read()
 
+@app.get("/health")
+async def health():
+    """Basic health/config endpoint safe to expose publicly (no secrets)."""
+    missing = []
+    if not os.getenv("OPENAI_API_KEY"):
+        missing.append("OPENAI_API_KEY")
+    if not os.getenv("FIRECRAWL_API_KEY"):
+        missing.append("FIRECRAWL_API_KEY")
+    if not SUPABASE_URL:
+        missing.append("SUPABASE_URL")
+    if not SUPABASE_KEY:
+        missing.append("SUPABASE_KEY")
+    if not JWT_SECRET:
+        missing.append("JWT_SECRET")
+
+    return {
+        "status": "ok",
+        "checks": {
+            "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
+            "firecrawl_configured": bool(os.getenv("FIRECRAWL_API_KEY")),
+            "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
+            "jwt_configured": bool(JWT_SECRET),
+        },
+        "missing": missing,
+    }
+
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -1758,8 +1809,11 @@ async def periodic_email_check():
 @app.on_event("startup")
 async def startup_event():
     """Start background tasks on application startup"""
-    asyncio.create_task(periodic_email_check())
-    logger.info("Email monitoring background task started")
+    if supabase_admin:
+        asyncio.create_task(periodic_email_check())
+        logger.info("Email monitoring background task started")
+    else:
+        logger.warning("Email monitoring background task NOT started (Supabase not configured).")
 
 
 if __name__ == "__main__":
