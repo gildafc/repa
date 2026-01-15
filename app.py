@@ -1745,6 +1745,11 @@ async def read_root():
     with open("static/index.html", "r") as f:
         return f.read()
 
+@app.head("/")
+async def head_root():
+    # Render (and some proxies) may issue HEAD probes; ensure we return 200.
+    return HTMLResponse(content="", status_code=200)
+
 @app.get("/health")
 async def health():
     """Basic health/config endpoint safe to expose publicly (no secrets)."""
@@ -1770,6 +1775,11 @@ async def health():
         },
         "missing": missing,
     }
+
+@app.head("/health")
+async def head_health():
+    # Ensure health checks that use HEAD still succeed.
+    return {"status": "ok"}
 
 
 # Mount static files
