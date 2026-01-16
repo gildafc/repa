@@ -3,7 +3,7 @@ REPA - Real Estate Personalized Assistant
 A minimal demo app for the LangFlow-based apartment matching workflow
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
@@ -22,7 +22,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from jose import JWTError, jwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncio
 import logging
 
@@ -838,6 +838,20 @@ async def login(request: LoginRequest):
         raise HTTPException(status_code=401, detail=f"Login failed: {str(e)}")
 
 
+@app.get("/debug/dev-token")
+async def dev_token(user_id: str, request: Request):
+    """
+    Local-only helper to generate a JWT for testing in the browser.
+    Disabled by default; enable by starting server with ENABLE_DEV_TOKEN=1.
+    """
+    if os.getenv("ENABLE_DEV_TOKEN") != "1":
+        raise HTTPException(status_code=404, detail="Not found")
+    if not request.client or request.client.host not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    token = create_access_token(data={"sub": user_id, "email": "dev-local@example.com"})
+    return {"access_token": token, "token_type": "bearer", "user_id": user_id}
+
+
 # User Criteria endpoints
 @app.get("/api/user/criteria", response_model=UserCriteriaResponse)
 async def get_user_criteria(user_id: str = Depends(verify_token)):
@@ -880,6 +894,8 @@ def get_imap_server(email_provider: str) -> str:
 def extract_urls_from_email_body(body: str) -> List[str]:
     """Extract URLs from email body (HTML or plain text)"""
     urls = []
+    property_domains = ("homegate.ch", "immoscout24.ch", "flatfox.ch")
+    homegate_listing_re = re.compile(r"^https?://(?:www\.)?homegate\.ch/(?:rent|buy)/\d+", re.IGNORECASE)
     
     # Try parsing as HTML first
     try:
@@ -899,6 +915,35 @@ def extract_urls_from_email_body(body: str) -> List[str]:
     url_pattern = r'https?://[^\s<>"]*(?:homegate\.ch|immoscout24\.ch|flatfox\.ch)[^\s<>"]*'
     found_urls = re.findall(url_pattern, body, re.IGNORECASE)
     urls.extend(found_urls)
+
+    # Some providers (notably Homegate) send tracked links (e.g. SendGrid) that redirect to the real listing.
+    # If we don't find any direct property URLs, attempt to resolve a small number of tracking URLs.
+    if not urls:
+        tracking_pattern = r'https?://[^\s<>"]*(?:ct\.sendgrid\.net/ls/click|sendgrid\.net/ls/click)[^\s<>"]*'
+        tracking_urls = re.findall(tracking_pattern, body, re.IGNORECASE)
+        if tracking_urls:
+            unique_tracking = list(dict.fromkeys([u.strip() for u in tracking_urls if u and u.strip()]))[:10]
+            logging.info(f"Found {len(unique_tracking)} tracking URLs, attempting to resolve redirects...")
+            for turl in unique_tracking:
+                try:
+                    # Use GET with redirects to land on the final destination URL.
+                    resp = requests.get(turl, allow_redirects=True, timeout=10, stream=True)
+                    final_url = resp.url
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+
+                    if final_url and any(d in final_url.lower() for d in property_domains):
+                        # Homegate tracking links can land on non-listing pages (municipality guide, cancel alert, etc.)
+                        # Only accept URLs that look like actual listing pages.
+                        if "homegate.ch" in final_url.lower() and not homegate_listing_re.match(final_url):
+                            logging.debug(f"Resolved tracking URL is not a listing page, skipping: {final_url}")
+                        else:
+                            urls.append(final_url)
+                            logging.info(f"Resolved tracking URL to listing: {final_url}")
+                except Exception as e:
+                    logging.debug(f"Failed to resolve tracking URL {turl}: {e}")
     
     # Handle URLs on separate lines (common in plain text emails)
     # Split by lines and check each line for URLs
@@ -908,7 +953,7 @@ def extract_urls_from_email_body(body: str) -> List[str]:
         # Check if line contains a URL (not just starts with http, might have whitespace)
         if 'http' in line.lower():
             # Check if it's a property URL
-            if any(domain in line.lower() for domain in ['homegate.ch', 'immoscout24.ch', 'flatfox.ch']):
+            if any(domain in line.lower() for domain in property_domains):
                 # Extract the full URL (might have leading/trailing whitespace or characters)
                 url_match = re.search(r'(https?://[^\s<>"]*(?:homegate\.ch|immoscout24\.ch|flatfox\.ch)[^\s<>"]*)', line, re.IGNORECASE)
                 if url_match:
@@ -926,6 +971,9 @@ def extract_urls_from_email_body(body: str) -> List[str]:
     seen = set()
     for url in urls:
         url = url.strip().rstrip('/')  # Remove trailing slash
+        # Filter out non-listing Homegate URLs (alerts, guides, etc.)
+        if "homegate.ch" in url.lower() and not homegate_listing_re.match(url):
+            continue
         if url and url not in seen:
             # Validate it's a proper URL
             if url.startswith('http://') or url.startswith('https://'):
@@ -945,7 +993,8 @@ def check_email_for_listings(
     email_provider: str,
     user_id: str,
     email_sender: Optional[str] = None,
-    email_subject_keywords: Optional[str] = None
+    email_subject_keywords: Optional[str] = None,
+    last_email_check: Optional[str] = None,
 ) -> List[dict]:
     """Check email inbox for new emails matching configured filters"""
     try:
@@ -958,10 +1007,27 @@ def check_email_for_listings(
         # Default values if not configured
         sender_filter = email_sender.lower().strip() if email_sender else None
         subject_keywords = [kw.strip().lower() for kw in email_subject_keywords.split(',')] if email_subject_keywords else ['match']
+
+        # If we have a last check timestamp, don't rely on UNSEEN (emails may be auto-marked read).
+        # Use IMAP SINCE (date-level granularity) and then filter precisely in code.
+        last_email_check_dt: Optional[datetime] = None
+        if last_email_check:
+            try:
+                # Stored by this app via datetime.utcnow().isoformat() (naive UTC).
+                last_email_check_dt = datetime.fromisoformat(str(last_email_check).replace("Z", ""))
+            except Exception:
+                last_email_check_dt = None
         
         # Handle multiple sender filters (comma-separated) - use OR logic
         # IMAP doesn't support OR directly, so we'll search all unread and filter in code
-        search_criteria = ['UNSEEN']
+        # Search for messages since the last check (with 1 day buffer, because IMAP SINCE is day-based).
+        if last_email_check_dt:
+            since_dt = last_email_check_dt - timedelta(days=1)
+            since_str = since_dt.strftime("%d-%b-%Y")  # IMAP date format, e.g. 15-Jan-2026
+            search_criteria = ['SINCE', since_str]
+            logging.info(f"Searching emails SINCE {since_str} (last check: {last_email_check_dt.isoformat()})")
+        else:
+            search_criteria = ['UNSEEN']
         sender_filters_list = []
         if sender_filter:
             # Split by comma if multiple senders provided
@@ -969,12 +1035,11 @@ def check_email_for_listings(
             logging.info(f"Sender filters configured: {sender_filters_list}")
             # Note: IMAP FROM search only supports one sender at a time
             # We'll search all UNSEEN emails and filter by sender in code
-            logging.info("Searching all unread emails, will filter by sender in code")
+            logging.info("Searching emails and filtering by sender in code")
         else:
-            logging.info("No sender filter configured, searching all unread emails")
+            logging.info("No sender filter configured, searching emails")
         
-        # Search for unread emails (we'll filter by sender and subject in code)
-        # Note: We search all UNSEEN emails because IMAP doesn't support OR for multiple senders
+        # Search for emails matching our base criteria (we'll still filter by sender + subject in code).
         status, messages = mail.search(None, *search_criteria)
         
         if status != 'OK':
@@ -1006,6 +1071,25 @@ def check_email_for_listings(
                         subject = str(subject) if subject else ''
                 else:
                     subject = ''
+
+                # If we have last check time, skip emails that are not newer (precise filtering).
+                if last_email_check_dt:
+                    try:
+                        email_date_header = email_message.get('Date')
+                        email_dt = parsedate_to_datetime(email_date_header) if email_date_header else None
+                        if email_dt:
+                            # Normalize to naive UTC for comparison (parsedate may include tzinfo).
+                            if email_dt.tzinfo is not None:
+                                email_dt = email_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                            if email_dt <= last_email_check_dt:
+                                logging.debug(
+                                    f"Skipping email - not newer than last check. "
+                                    f"Email date: {email_dt.isoformat()}, last check: {last_email_check_dt.isoformat()}"
+                                )
+                                continue
+                    except Exception:
+                        # If date parsing fails, fall back to other filters (sender/subject/dedupe).
+                        pass
                 
                 # Get sender email address for filtering
                 sender_address = email_message['From'] or ''
@@ -1136,7 +1220,26 @@ async def process_new_email_listings(user_id: str, email_address: str, app_passw
         logging.info(f"Filters - Sender: {email_sender}, Subject keywords: {email_subject_keywords}")
         
         # Check for new emails with configured filters
-        new_listings = check_email_for_listings(email_address, app_password, email_provider, user_id, email_sender, email_subject_keywords)
+        # Try to respect last_email_check so we don't miss emails that are already marked read.
+        last_email_check = None
+        try:
+            criteria_response = supabase_admin.table("user_criteria").select("last_email_check").eq("user_id", user_id).execute()
+            if criteria_response.data and len(criteria_response.data) > 0:
+                last_email_check = criteria_response.data[0].get("last_email_check")
+        except Exception:
+            last_email_check = None
+
+        # IMAP + some URL resolution is blocking I/O; run it in a worker thread so we don't block FastAPI's event loop.
+        new_listings = await asyncio.to_thread(
+            check_email_for_listings,
+            email_address,
+            app_password,
+            email_provider,
+            user_id,
+            email_sender,
+            email_subject_keywords,
+            last_email_check,
+        )
         
         logging.info(f"Found {len(new_listings)} new listings to process")
         
@@ -1438,6 +1541,30 @@ async def get_email_analyses(
 ):
     """Get email analysis results for the user"""
     _require_supabase()
+    def _extract_match_score(report: str) -> Optional[int]:
+        """
+        Best-effort parser for the "Match Score: XX%" line in the LLM report.
+        Expected format in prompt: "## 🎯 Match Score: [X]%" (but we allow variants).
+        """
+        if not report:
+            return None
+        try:
+            # Common variants:
+            # - "## 🎯 Match Score: 87%"
+            # - "## 🎯 Match Score: [87]%"
+            # - "Match Score: 87%"
+            m = re.search(r"Match\s*Score\s*:\s*\[?\s*(\d{1,3})\s*\]?\s*%", report, flags=re.IGNORECASE)
+            if not m:
+                return None
+            score = int(m.group(1))
+            if score < 0:
+                return 0
+            if score > 100:
+                return 100
+            return score
+        except Exception:
+            return None
+
     try:
         # Use service role client for backend operations (bypasses RLS since we verify JWT ourselves)
         # Get all processed emails with analysis results for this user
@@ -1497,22 +1624,33 @@ async def get_email_analyses(
                 
                 # Only include items that have a report
                 if analysis_result and analysis_result.get('report'):
+                    report_text = analysis_result.get('report')
+                    match_score = _extract_match_score(report_text) if isinstance(report_text, str) else None
                     analyses.append({
                         'id': str(item.get('id')),
                         'listing_url': listing_url,
                         'email_subject': item.get('email_subject') or 'No subject',
                         'email_from': item.get('email_from') or 'Unknown',
                         'created_at': item.get('processed_at') or item.get('created_at'),
-                        'report': analysis_result.get('report'),
+                        'report': report_text,
                         'url': analysis_result.get('url', listing_url),
+                        'match_score': match_score,
                         'status': 'completed'
                     })
         
         logging.info(f"Returning {len(analyses)} completed analyses, {len(pending_analyses)} pending")
         
-        # Sort analyses by processed_at descending if we couldn't order in query
-        if analyses and not any('processed_at' in str(a.get('created_at', '')) for a in analyses[:1]):
-            analyses.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        # Sort analyses by match score (highest first), then recency as tie-breaker.
+        # Keep items without a parsable score at the bottom.
+        if analyses:
+            analyses.sort(
+                key=lambda x: (
+                    x.get('match_score') is not None,
+                    x.get('match_score') if x.get('match_score') is not None else -1,
+                    str(x.get('created_at') or ""),
+                ),
+                reverse=True,
+            )
         
         # Sort pending analyses too
         if pending_analyses:
@@ -1791,7 +1929,10 @@ async def periodic_email_check():
     while True:
         try:
             # Get all users with email monitoring enabled
-            response = supabase_admin.table("user_criteria").select("*").eq("email_monitoring_enabled", True).execute()
+            # Supabase client calls are synchronous; run them in a thread to avoid blocking the event loop (especially during startup).
+            response = await asyncio.to_thread(
+                lambda: supabase_admin.table("user_criteria").select("*").eq("email_monitoring_enabled", True).execute()
+            )
             
             if response.data:
                 for user_criteria in response.data:

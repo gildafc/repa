@@ -621,6 +621,37 @@
 
     <script>
         let authToken = localStorage.getItem('authToken');
+        let analysesRefreshTimer = null;
+        let lastAnalysesSignature = null;
+        let isUserScrolling = false;
+        let scrollIdleTimer = null;
+
+        // Avoid disruptive auto-refresh while the user is actively scrolling/reading.
+        window.addEventListener('scroll', () => {
+            isUserScrolling = true;
+            if (scrollIdleTimer) clearTimeout(scrollIdleTimer);
+            scrollIdleTimer = setTimeout(() => {
+                isUserScrolling = false;
+            }, 600);
+        }, { passive: true });
+
+        // Local-dev helper: allow setting auth token via query param on localhost only.
+        // Example: http://127.0.0.1:8000/profile?token=JWT_HERE
+        try {
+            const isLocalHost = window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost';
+            if (isLocalHost) {
+                const params = new URLSearchParams(window.location.search);
+                const tokenFromQuery = params.get('token');
+                if (tokenFromQuery && tokenFromQuery.split('.').length === 3) {
+                    localStorage.setItem('authToken', tokenFromQuery);
+                    authToken = tokenFromQuery;
+                    // Remove token from URL (avoid leaking in screenshots/logs/history)
+                    window.history.replaceState({}, document.title, '/profile');
+                }
+            }
+        } catch (e) {
+            // ignore
+        }
         
         if (!authToken) {
             window.location.href = '/';
@@ -997,7 +1028,13 @@
             try {
                 analysesSection.style.display = 'block';
                 analysesLoading.style.display = 'block';
-                analysesList.innerHTML = '';
+                // Preserve scroll position + expanded/collapsed state to prevent jumping to the top.
+                const prevScrollY = window.scrollY;
+                const expandedStateById = {};
+                document.querySelectorAll('.analysis-item[id^="analysis-item-"]').forEach((el) => {
+                    const id = el.id.replace('analysis-item-', '');
+                    expandedStateById[id] = el.classList.contains('expanded') && !el.classList.contains('collapsed');
+                });
                 
                 const response = await fetch('/api/user/analyses', {
                     method: 'GET',
@@ -1031,8 +1068,19 @@
                 
                 console.log('Analyses data:', data);
 
+                // De-dupe re-renders: if nothing relevant changed, don't rebuild DOM (prevents scroll jumps).
+                const pendingSig = (data.pending || []).map((x) => `${x.id}:${x.status || ''}`).join(',');
+                const analysesSig = (data.analyses || []).map((x) => `${x.id}:${x.match_score ?? ''}`).join(',');
+                const signature = `${(data.pending || []).length}|${(data.analyses || []).length}|${pendingSig}|${analysesSig}`;
+                const shouldRerender = signature !== lastAnalysesSignature;
+                lastAnalysesSignature = signature;
+
                 // Show pending analyses if any
-                if (data.pending && data.pending.length > 0) {
+                if (shouldRerender) {
+                    analysesList.innerHTML = '';
+                }
+
+                if (data.pending && data.pending.length > 0 && shouldRerender) {
                     const pendingHtml = data.pending.map(item => `
                         <div style="background: #fff3cd; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #ffc107;">
                             <div style="display: flex; justify-content: space-between; align-items: start;">
@@ -1066,7 +1114,7 @@
                     }
                 }
 
-                if (data.analyses && data.analyses.length > 0) {
+                if (data.analyses && data.analyses.length > 0 && shouldRerender) {
                     // Append to existing pending analyses if any
                     const existingHtml = analysesList.innerHTML;
                     analysesList.innerHTML = existingHtml + data.analyses.map((analysis, index) => `
@@ -1115,16 +1163,42 @@
                             contentDiv.innerHTML = analysis.report.replace(/\n/g, '<br>');
                         }
                     });
-                } else if (data.pending && data.pending.length > 0) {
+                } else if (data.pending && data.pending.length > 0 && shouldRerender) {
                     // Only pending analyses, show them
                     analysesList.innerHTML = '';
-                } else {
+                } else if (shouldRerender) {
                     analysesList.innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">No analyses yet. Click "Check Email Now" to analyze listings from your emails.</p>';
+                }
+
+                // Restore expanded/collapsed state after a rerender.
+                if (shouldRerender) {
+                    Object.keys(expandedStateById).forEach((id) => {
+                        const el = document.getElementById(`analysis-item-${id}`);
+                        if (!el) return;
+                        const shouldBeExpanded = expandedStateById[id];
+                        if (shouldBeExpanded) {
+                            el.classList.add('expanded');
+                            el.classList.remove('collapsed');
+                        } else {
+                            el.classList.remove('expanded');
+                            el.classList.add('collapsed');
+                        }
+                    });
+                    // Restore scroll after the DOM updates have been applied.
+                    requestAnimationFrame(() => {
+                        window.scrollTo(0, prevScrollY);
+                    });
                 }
                 
                 // If there are pending analyses, auto-refresh after 10 seconds
                 if (data.pending && data.pending.length > 0) {
-                    setTimeout(() => {
+                    if (analysesRefreshTimer) clearTimeout(analysesRefreshTimer);
+                    analysesRefreshTimer = setTimeout(() => {
+                        // Don't auto-refresh while the user is scrolling/reading (prevents jump-to-top).
+                        if (isUserScrolling) {
+                            analysesRefreshTimer = setTimeout(loadAnalyses, 3000);
+                            return;
+                        }
                         console.log('Auto-refreshing analyses...');
                         loadAnalyses();
                     }, 10000); // Refresh every 10 seconds
